@@ -17,6 +17,13 @@ This is an unofficial community project and is not affiliated with OpenAI,
 ChatGPT, or Cloudflare. Use it only with systems you own or are authorized to
 administer.
 
+## Codex Cloud VMs
+
+This fork adds `npm run cloud -- up`, `ssh`, `verify`, `status`, `resume`, and
+`down` for disposable Codex Cloud VMs. See [Connect to Codex Cloud over SSH](docs/codex-cloud.md)
+for setup, secure state, cleanup, measured VM specs, and usage limits.
+Eight concurrent VMs were verified; eight is not a platform maximum.
+
 ## Quick start
 
 Requirements: a Cloudflare account, Node.js 22+, `git`, `ssh`, and

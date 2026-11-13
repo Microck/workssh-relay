@@ -6,6 +6,13 @@ WebSocket 的临时 Work 沙盒。
 > 非官方社区项目，与 OpenAI、ChatGPT 或 Cloudflare 均无隶属关系。只可用于你
 > 拥有或明确获准管理的环境。
 
+## Codex Cloud
+
+此 fork 增加 `npm run cloud -- up`、`ssh`、`verify`、`status`、`resume` 和
+`down`，用于创建、连接和清理临时 Codex Cloud VM。
+安装步骤、权限、清理方式和实测资源见 [Codex Cloud SSH 指南](docs/codex-cloud.md)。
+已验证八台独立 VM 同时连接；这不代表平台上限。
+
 ## 它解决什么问题
 
 很多托管沙盒没有公网入站端口，但可以发起 HTTPS/WebSocket 出站连接。WorkSSH

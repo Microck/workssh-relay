@@ -14,3 +14,8 @@ host_key
 host_key.pub
 *.tgz
 *.zip
+session.json
+client_key
+client_key.pub
+vm-*.json
+host-[0-9]*
