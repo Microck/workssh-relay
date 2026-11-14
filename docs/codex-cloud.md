@@ -28,9 +28,9 @@ Setup defaults to `gpt-6-luna` with medium reasoning at Standard speed. It was t
 
 - `up --count 1..8 --state-dir PATH`: create one private environment config, a config-scoped vault value, a dedicated relay, and independent VM tasks. The state directory must not exist. The count is a helper safety bound, not a platform limit.
 - `up --dry-run`: print the intended resource changes without reading credentials, creating files, calling APIs or consuming credits.
-- `status --state-dir PATH`: show saved progress and live runtime states. Reconcile interrupted resource creation using this session's unique resource names. No model task starts.
-- `resume --state-dir PATH`: resume existing task threads and request a restart only after checking that their exact supervisor is absent. It never allocates replacement VMs or silently accepts changed host keys. Credit consent applies to resumed model work too.
-- `ssh --state-dir PATH --vm N -- [command...]`: connect with the saved private identity and pinned host key. With no command, open an interactive shell. It does not edit your normal SSH configuration.
+- `status --state-dir PATH`: show saved setup progress and live provider runtime states. `ready` is `null` for an unprobed session, or `false` after known teardown/offline state or the recorded agent deadline. `sshReachability` is `expired` after that deadline, otherwise `not-probed`. `setupComplete`, `lastSshVerifiedAt`, and the agent deadline are historical evidence, not current reachability. Provider `connected` does not mean the SSH agent is connected. No SSH probe or model task starts.
+- `resume --state-dir PATH [--lifetime-minutes N]`: recover the same runtime and request a restart only after exact argv checks show its supervisor is absent. The existing host-key pin must match before launch. The new process is detached from the model command session, but has its own timeout. The default recovery bound is the saved lifetime; an explicit bound applies only to this recovery. It never allocates replacements or regenerates keys. Credit consent applies to resumed model work too.
+- `ssh --state-dir PATH --vm N -- [command...]`: connect with the saved private identity and pinned host key. Arguments after `--` are literal argv, including empty strings, quotes and multiline code. Use `-- sh -c 'shell expression'` explicitly for shell syntax. With no command, open an interactive shell. It does not edit normal SSH configuration.
 - `verify --state-dir PATH`: execute overlapping SSH commands on every saved VM, check distinct runtime IDs, hostnames and host keys, collect CPU/memory/filesystem measurements, and require every command to exit successfully. `--hold-seconds` defaults to 20.
 - `down --state-dir PATH --yes`: interrupt active owned setup turns, archive owned threads, delete the session's vault value, config and relay, confirm its runtimes are offline, and remove local private keys/configs. It does not delete other environments or overwrite an existing Worker. If any deletion cannot be confirmed, retain state and return a failure so you can retry cleanup.
 
@@ -50,13 +50,27 @@ Creation requests are not blindly retried after a timeout. If `up` stops, run `s
 
 If a crash leaves `.lock`, check the PID in `.lock/pid` and confirm that CLI process has ended before removing the lock directory. Do not remove a live process's lock.
 
-A host-key mismatch stops the connection. If the platform replaced a VM, remove the old session with `down` and create a fresh one. Do not disable host-key checking.
+A host-key mismatch stops the connection and recovery before launch. Identity uses the key type and base64 key data, not its optional comment. `hostKeySha256` is the SHA256 of that canonical two-field text. If the platform replaced a VM, remove the old session with `down` and create a fresh one. Do not disable host-key checking.
 
 ## Understand lifetime and approval
 
-The agent's default lifetime is 20 minutes, including installation. Set `--lifetime-minutes` at creation to choose a bound from 1 to 120 minutes. This bounds the test process; it cannot prevent the platform from reclaiming the VM. `resume` starts another bounded supervisor only after checking the old one is absent.
+The agent's default access window is 20 minutes, including installation. Choose `--lifetime-minutes` from 1 through 43200, such as 480 for an eight-hour work session. The 30-day local limit matches Raft's TTL range; it does not guarantee provider uptime. Integrations can instead pass `--agent-deadline` as an absolute Unix-millisecond deadline, mutually exclusive with minutes. Every VM in an invocation shares that deadline. Setup and the detached SSH supervisor use the same deadline, so returning from the setup command does not end SSH access. A private launch lock and exact process argv checks prevent duplicate supervisors; recovery refuses orphaned child processes and untracked existing supervisors instead of guessing. An expired agent does not establish VM deletion. Explicit `resume` can start another bounded agent on the same runtime. An already-running agent is reused without extending its deadline.
 
 Cloud filesystems may be read-only to ordinary commands. Each new helper task requests `on-request` approval with the platform's `auto_review` reviewer. Setup asks that reviewer for the authorized scratch-only installation. It does not alter global policies or override a rejection. Relay secrets arrive through a scoped vault environment variable and never appear literally in prompts or command strings. Setup stops on network or authentication denials.
+
+`ssh` and `verify` reject an expired access window before opening a connection and report the explicit resume command. They never start model work or renew access automatically. With authorization for another bounded agent, run `npm run cloud -- resume --state-dir PATH --lifetime-minutes 480 --json`, then verify files with `ssh`. If a connection fails before its deadline, inspect status rather than assuming expiry. A failed recovery is not permission to allocate a replacement, regenerate a host key, or retry a denied command.
+
+SDK/Raft uses the same absolute deadline at creation. Use its explicit `provider.reconnect(id, { timeoutMs })` or `raft resume BOX --ttl SECONDS` to recover access and record the helper's confirmed deadline. Direct helper recovery does not extend a separate SDK/Raft access window. For lifetime measurements, calculate `createdAt + timeoutMs` immediately before the check. A delayed scheduled check may already be past that deadline even if its label says "before expiry". Do not rewrite records to make a measurement pass; record missing files, permission failures and unobserved files separately.
+
+The helper preserves multiline Python as one argument:
+
+```bash
+npm run --silent cloud -- ssh --state-dir PATH --vm 1 -- python3 -c 'import hashlib
+from pathlib import Path
+print(hashlib.sha256(Path("/workspace/payload.bin").read_bytes()).hexdigest())'
+```
+
+Pass the same arguments individually with `subprocess.run` or `execFile`. Do not prequote or join them into one remote command.
 
 ## Tested behavior
 

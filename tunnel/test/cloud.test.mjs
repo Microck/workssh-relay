@@ -9,6 +9,7 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import WebSocket, { WebSocketServer } from "ws";
 import { request, ApiError, CloudConnection, privateJson, readPrivateJson } from "../src/cloud-api.mjs";
+import { sessionSummary } from "../src/codex-cloud.mjs";
 
 const cli = fileURLToPath(new URL("../src/codex-cloud.mjs", import.meta.url));
 
@@ -98,6 +99,17 @@ test("a server approval request cannot masquerade as a pending RPC response", as
   assert.equal((await reply).error.code, -32601);
 });
 
+test("contradictory launch deadlines cannot become confirmed recovery", async (t) => {
+  const { connection, peer } = await socketPair(t);
+  const rejected = assert.rejects(connection.wait("owned-vm", "recovery"), /inconsistent agent launches/);
+  for (const deadline of ["2026-11-14T17:40:00Z", "2026-11-14T19:40:00Z"]) {
+    const event = item("owned-vm", "recovery", "QUFBQQ==");
+    event.params.item.text += `\nWORKSSH_AGENT=${JSON.stringify({ wrapperPid: 1234, deadline })}`;
+    peer.send(JSON.stringify(event));
+  }
+  await rejected;
+});
+
 test("replacing session state preserves private permissions and rejects exposed files", (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "workssh-state-test-"));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
@@ -140,4 +152,22 @@ test("partially deleted sessions cannot resume model work or open new SSH sessio
     assert.match(rejected.stderr, /Session teardown has started/);
     assert.equal(fs.existsSync(path.join(directory, ".lock")), false);
   }
+});
+
+test("saved setup readiness never becomes a live SSH claim", () => {
+  const session = { phase: "ready", count: 1, vms: [{ index: 1, hostPublicKey: "ssh-ed25519 QUFBQQ== original-comment", readyAt: "2026-01-01T00:00:00Z", agentDeadline: "2999-01-01T00:00:00Z" }] };
+  const unprobed = sessionSummary(session, "/private/fixture").vms[0];
+  assert.equal(unprobed.setupComplete, true);
+  assert.equal(unprobed.ready, null);
+  assert.equal(unprobed.sshReachability, "not-probed");
+  const verified = sessionSummary(session, "/private/fixture", true).vms[0];
+  assert.equal(verified.ready, true);
+  session.vms[0].hostPublicKey = "ssh-ed25519 QUFBQQ== changed-comment";
+  assert.equal(sessionSummary(session, "/private/fixture").vms[0].hostKeySha256, unprobed.hostKeySha256);
+  session.vms[0].agentDeadline = "2000-01-01T00:00:00Z";
+  const expired = sessionSummary(session, "/private/fixture").vms[0];
+  assert.equal(expired.ready, false);
+  assert.equal(expired.agentDeadlineElapsed, true);
+  assert.equal(expired.sshReachability, "expired");
+  assert.equal(expired.offline, false, "an expired agent is not a provider shutdown");
 });

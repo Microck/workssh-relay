@@ -172,6 +172,13 @@ export class CloudConnection {
         if (result.hostPublicKey && result.hostPublicKey !== match[1]) throw new Error("Cloud task reported inconsistent host keys");
         result.hostPublicKey = match[1];
       }
+      const launch = output?.match(/WORKSSH_AGENT=(\{[^\r\n]+\})/);
+      if (launch) {
+        const report = JSON.parse(launch[1]);
+        if (!Number.isFinite(Date.parse(report.deadline)) || !Number.isInteger(report.wrapperPid) || report.wrapperPid <= 0) throw new Error("Cloud task reported an invalid bounded agent launch");
+        if (result.agentProcess && (result.agentProcess.deadline !== report.deadline || result.agentProcess.wrapperPid !== report.wrapperPid)) throw new Error("Cloud task reported inconsistent agent launches");
+        result.agentProcess = { deadline: report.deadline, wrapperPid: report.wrapperPid };
+      }
     }
     if (event.method === "turn/completed") {
       result.status = params.turn.status;

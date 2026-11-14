@@ -8,6 +8,7 @@ import { parseArgs } from "node:util";
 import { spawn } from "node:child_process";
 import { setTimeout as delay } from "node:timers/promises";
 import { ApiError, CLOUD, RUNTIMES, CLOUDFLARE, request, privateJson, readPrivateJson, cloudCredentials, cloudflareCredentials, redact, CloudConnection } from "./cloud-api.mjs";
+import { agentLaunchCommand, canonicalHostKey } from "./cloud-agent.mjs";
 
 const root = fileURLToPath(new URL("../../", import.meta.url));
 const repoUrl = "https://github.com/catoncat/workssh-relay.git";
@@ -25,7 +26,8 @@ Commands: up, resume, status, ssh, verify, down
 Options:
   --state-dir PATH          Private session directory; required except for dry-run
   --count N                 Independent VMs, 1..8 (default 1)
-  --lifetime-minutes N      Agent process bound, 1..120 (default 20)
+  --lifetime-minutes N      Access window for up/resume, 1..43200 (default 20 at up)
+  --agent-deadline MS       Absolute Unix-ms access deadline, instead of minutes
   --hold-seconds N          Verify overlap, 1..120 (default 20)
   --vm N                    VM index for ssh (default 1)
   --model ID                Setup model (default gpt-6-luna); no fallback
@@ -57,6 +59,7 @@ let state;
 let directory;
 let options;
 let cloudHeaders;
+let agentDeadline;
 let cf;
 
 function save() { privateJson(path.join(directory, "session.json"), state); }
@@ -214,15 +217,12 @@ async function up(count) {
   await Promise.all(state.vms.map(finishSetup));
   state.phase = "ready";
   save();
-  return summary();
+  return summary(true);
 }
 
-export function setupPrompt(vm, restarting, session = state) {
-  const common = `This is an authorized disposable WorkSSH VM test. WORKSSH_SESSION=${session.id} WORKSSH_VM_INDEX=${vm.index}. Use only ${vm.scratch}. Never print credentials, config contents, or environment dumps. Use the normal per-command reviewer with sandbox_permissions=require_escalated and an honest scratch-only installation justification, because ordinary commands may have a read-only filesystem. A read-only failure is not evidence about variable presence. Do not override a reviewer rejection, change global policies or proxies, or bypass any network/authentication denial. Keep the supervisor in a managed process session bounded to ${session.lifetimeMinutes * 60} seconds including installation, and return promptly once it connects. Report HOST_PUBLIC_KEY=<actual host_key.pub contents>, HOSTNAME and actual relay status. Do not wait for the full timeout or use unrelated VM keepalives.`;
-  const observation = "If an exec tool returns a running session or initially empty output, collect its output using write_stdin and the returned session_id. Empty initial output is not a command failure. Complete installation and observe relay connected before the final report.";
-  if (restarting) return `${common} ${observation} Inspect only supervisors whose command line matches supervisor.mjs and --config ${vm.scratch}/state/agent.json. If one is alive, do not duplicate it; report its status and existing public host key. Otherwise restart the EXISTING supervisor/config under scratch, bounded by timeout. Do not reinstall or generate a host key. If files vanished, stop and report VM replacement.`;
-  const script = [
-    "set -euo pipefail",
+export function setupCommand(vm, restarting, session = state) {
+  const launch = agentLaunchCommand({ scratch: vm.scratch, deadline: vm.pendingAgentDeadline, ...(restarting ? { expectedHostKey: canonicalHostKey(vm.hostPublicKey) } : {}) });
+  const installation = restarting ? [] : [
     `if [ -n "\${${session.variableName}:-}" ]; then printf 'vault_var_present=true\\n'; else printf 'vault_var_present=false\\n'; exit 1; fi`,
     `export WORKSSH_RELAY_TOKEN="\${${session.variableName}}"`,
     `export WORKSSH_WORKER_URL=${quote(session.workerUrl)} WORKSSH_TUNNEL_ID=${quote(vm.tunnelId)} WORKSSH_PUBLIC_KEY=${quote(session.publicKey)} WORKSSH_STATE_DIR=${quote(`${vm.scratch}/state`)}`,
@@ -233,15 +233,20 @@ export function setupPrompt(vm, restarting, session = state) {
     `git clone --quiet ${quote(repoUrl)} ${quote(`${vm.scratch}/repo`)}`,
     `git -C ${quote(`${vm.scratch}/repo`)} checkout --quiet ${agentRevision}`,
     `bash ${quote(`${vm.scratch}/repo/scripts/install-agent.sh`)}`,
-    `printf 'HOST_PUBLIC_KEY='; cat ${quote(`${vm.scratch}/state/host_key.pub`)}`,
-    `hostname`,
-    `exec node ${quote(`${vm.scratch}/repo/tunnel/src/supervisor.mjs`)} --config ${quote(`${vm.scratch}/state/agent.json`)}`,
-  ].join("\n");
-  return `${common} ${observation}\nExecute this complete script through normal command approval, wrapped in timeout ${session.lifetimeMinutes * 60} seconds. The installer and supervisor at pinned revision ${agentRevision} were reviewed for this helper; run them without a separate source-inspection turn. The variable check is independent of filesystem writes. Secrets are referenced only through the supplied variable. Do not use shell tracing, printenv, or HOME overrides.\n\n${script}`;
+  ];
+  const script = ["set -euo pipefail", ...installation, launch, "hostname"].join("\n");
+  const seconds = Math.max(1, Math.floor((Date.parse(vm.pendingAgentDeadline) - Date.now()) / 1000));
+  return `timeout --signal=TERM --kill-after=5s ${seconds}s bash <<'WORKSSH_SETUP'\n${script}\nWORKSSH_SETUP`;
+}
+
+export function setupPrompt(vm, restarting, session = state) {
+  const common = `This is an authorized disposable WorkSSH VM test. WORKSSH_SESSION=${session.id} WORKSSH_VM_INDEX=${vm.index}. Use only ${vm.scratch}. Never print credentials, config contents, logs or environment dumps. Use the normal per-command reviewer with sandbox_permissions=require_escalated and an honest scratch-only ${restarting ? "recovery" : "installation"} justification. Do not override a reviewer rejection, change global policies or proxies, or bypass a network/authentication denial. The user authorizes a detached SSH supervisor, independent of the model command session, under its own timeout ending no later than ${vm.pendingAgentDeadline}. Do not add keepalives or wait for the lifetime to elapse.`;
+  return `${common} ${restarting ? "Use only the EXISTING supervisor/config and host key; never reinstall or regenerate files. If an existing process has no matching launch journal, stop and report it rather than guessing." : "The pinned installer and the embedded bounded launcher are the reviewed implementation."} Execute the exact multiline command in the fenced block below once through normal approval, including its literal heredoc delimiters. Do not wrap it in bash -c, escape it again, or rewrite it. If the command is still running, collect its output with its returned session ID. Empty initial output is not failure. Report the exact HOST_PUBLIC_KEY and WORKSSH_AGENT lines from successful command output. Do not use shell tracing, printenv or HOME overrides.\n\n\`\`\`bash\n${setupCommand(vm, restarting, session)}\n\`\`\``;
 }
 async function startSetup(vm, restarting) {
   checkInterrupted();
   const socket = await rpc();
+  vm.pendingAgentDeadline = agentDeadline;
   vm.setupPending = true;
   vm.lastSetupWasRestart = restarting;
   save();
@@ -255,8 +260,11 @@ async function startSetup(vm, restarting) {
 async function finishSetup(vm) {
   const result = await (await rpc()).wait(vm.threadId, vm.turnId);
   if (result.status !== "completed" || !result.hostPublicKey) throw new Error(`VM ${vm.index} did not report a host key: ${result.message ?? result.status}`);
-  if (vm.hostPublicKey && vm.hostPublicKey !== result.hostPublicKey) throw new Error(`VM ${vm.index} host key changed; refusing automatic acceptance. Use down and create a fresh session`);
-  vm.hostPublicKey = result.hostPublicKey;
+  if (vm.hostPublicKey && canonicalHostKey(vm.hostPublicKey) !== canonicalHostKey(result.hostPublicKey)) throw new Error(`VM ${vm.index} host key changed; refusing automatic acceptance. Use down and create a fresh session`);
+  if (!result.agentProcess || !Number.isFinite(Date.parse(result.agentProcess.deadline)) || Date.parse(result.agentProcess.deadline) > Date.parse(vm.pendingAgentDeadline)) throw new Error(`VM ${vm.index} did not confirm a bounded agent launch; inspect its task before retrying`);
+  vm.hostPublicKey = canonicalHostKey(result.hostPublicKey);
+  vm.agentDeadline = result.agentProcess.deadline;
+  delete vm.pendingAgentDeadline;
   save();
   const marker = `WORKSSH_READY_${state.id}_${vm.index}`;
   const output = await run("ssh", ["-T", ...sshArgs(vm), `printf '%s' ${quote(marker)}`], { timeout: 40_000 });
@@ -313,8 +321,8 @@ async function reconcile() {
         const messages = turn.items.filter((i) => i.type === "agentMessage").map((i) => i.text).join("\n");
         const match = messages.match(/HOST_PUBLIC_KEY=(ssh-ed25519\s+[A-Za-z0-9+/=]+)/);
         if (match) {
-          if (vm.hostPublicKey && vm.hostPublicKey !== match[1]) throw new Error(`VM ${vm.index} host key changed`);
-          vm.hostPublicKey = match[1];
+          if (vm.hostPublicKey && canonicalHostKey(vm.hostPublicKey) !== canonicalHostKey(match[1])) throw new Error(`VM ${vm.index} host key changed`);
+          vm.hostPublicKey = canonicalHostKey(match[1]);
         }
       }
     }
@@ -348,7 +356,7 @@ async function resume() {
   await Promise.all(state.vms.map(finishSetup));
   state.phase = "ready";
   save();
-  return summary();
+  return summary(true);
 }
 
 function sshArgs(vm) {
@@ -357,7 +365,7 @@ function sshArgs(vm) {
   const hosts = path.join(directory, `host-${vm.index}`);
   // Rebuild only local client files from private canonical session state.
   privateJson(config, { workerUrl: state.workerUrl, relayToken: state.relayToken, tunnelId: vm.tunnelId, transport: "websocket" });
-  fs.writeFileSync(hosts, `workssh.invalid ${vm.hostPublicKey}\n`, { mode: 0o600 });
+  fs.writeFileSync(hosts, `workssh.invalid ${canonicalHostKey(vm.hostPublicKey)}\n`, { mode: 0o600 });
   return ["-F", "/dev/null", "-o", "BatchMode=yes", "-o", "ConnectTimeout=30", "-o", "StrictHostKeyChecking=yes", "-o", `UserKnownHostsFile=${hosts}`, "-o", "GlobalKnownHostsFile=/dev/null", "-o", "IdentitiesOnly=yes", "-i", path.join(directory, "client_key"), "-o", `ProxyCommand=node ${quote(path.join(root, "tunnel/src/proxy.mjs"))} --config ${quote(config)}`, "root@workssh.invalid"];
 }
 
@@ -407,8 +415,9 @@ async function verify() {
     if (children.some((c) => c.exit !== 0 || !c.done)) throw new Error("An SSH measurement failed or did not complete its overlap hold");
     state.verification = { count: state.count, verifiedAt: new Date().toISOString(), holdSeconds: hold, allExitZero: true };
     state.phase = "ready";
+    for (const vm of state.vms) vm.readyAt = state.verification.verifiedAt;
     save();
-    return { ...summary(), verification: state.verification, specs: state.vms.map((v) => ({ vm: v.index, ...v.specs })), maximumEstablished: false };
+    return { ...summary(true), verification: state.verification, specs: state.vms.map((v) => ({ vm: v.index, ...v.specs })), maximumEstablished: false };
   } finally {
     for (const child of children) if (child.child.exitCode === null) child.child.kill("SIGTERM");
   }
@@ -507,9 +516,25 @@ async function absentAfterDelete(remove, read) {
   throw new Error("Resource still exists after deletion");
 }
 
-function summary() {
-  return { stateDirectory: directory, phase: state.phase, model: state.model, count: state.count, vms: state.vms.map((v) => ({ index: v.index, threadId: v.threadId, ready: state.phase === "ready" && !v.offline && Boolean(v.hostPublicKey), runtimeId: v.runtimeId, offline: v.offline ?? false })), ...(state.verification ? { verification: state.verification } : {}) };
+export function sessionSummary(session, stateDirectory, sshVerified = false) {
+  return {
+    stateDirectory, phase: session.phase, model: session.model, count: session.count,
+    vms: session.vms.map((v) => {
+      const setupComplete = session.phase === "ready" && !v.offline && Boolean(v.hostPublicKey);
+      const agentDeadlineElapsed = v.agentDeadline ? Date.now() >= Date.parse(v.agentDeadline) : null;
+      return {
+        index: v.index, threadId: v.threadId, runtimeId: v.runtimeId, offline: v.offline ?? false,
+        setupComplete, ready: !setupComplete || agentDeadlineElapsed ? false : sshVerified ? true : null,
+        sshReachability: agentDeadlineElapsed ? "expired" : sshVerified ? "reachable" : "not-probed", lastSshVerifiedAt: v.readyAt ?? null,
+        agentDeadline: v.agentDeadline ?? null, agentDeadlineElapsed,
+        hostKeySha256: v.hostPublicKey ? crypto.createHash("sha256").update(canonicalHostKey(v.hostPublicKey)).digest("hex") : null,
+      };
+    }),
+    ...(session.verification ? { verification: session.verification } : {}),
+  };
 }
+
+function summary(sshVerified = false) { return sessionSummary(state, directory, sshVerified); }
 
 async function main() {
   const raw = process.argv.slice(2);
@@ -519,19 +544,26 @@ async function main() {
   if (cliArgs.includes("--version")) { console.log("0.1.0"); return; }
   const forwarded = separator < 0 ? [] : raw.slice(separator + 1);
   const parsed = parseArgs({ args: cliArgs, allowPositionals: true, options: {
-    "state-dir": { type: "string" }, model: { type: "string" }, count: { type: "string" }, "lifetime-minutes": { type: "string" }, "hold-seconds": { type: "string" }, vm: { type: "string" }, "auth-file": { type: "string" }, "cloudflare-env": { type: "string" }, "account-id": { type: "string" }, "allow-credits": { type: "boolean" }, "dry-run": { type: "boolean" }, yes: { type: "boolean" }, json: { type: "boolean" },
+    "state-dir": { type: "string" }, model: { type: "string" }, count: { type: "string" }, "lifetime-minutes": { type: "string" }, "agent-deadline": { type: "string" }, "hold-seconds": { type: "string" }, vm: { type: "string" }, "auth-file": { type: "string" }, "cloudflare-env": { type: "string" }, "account-id": { type: "string" }, "allow-credits": { type: "boolean" }, "dry-run": { type: "boolean" }, yes: { type: "boolean" }, json: { type: "boolean" },
   } });
   options = parsed.values;
   const [command, ...extra] = parsed.positionals;
   if (!["up", "status", "resume", "ssh", "verify", "down"].includes(command) || extra.length) throw new UsageError("Choose up, status, resume, ssh, verify or down; use --help");
   if (forwarded.length && command !== "ssh") throw new UsageError("Only ssh accepts a command after --");
   const count = number(options.count ?? "1", "--count", 1, 8);
-  const lifetime = number(options["lifetime-minutes"] ?? "20", "--lifetime-minutes", 1, 120);
+  let lifetime = number(options["lifetime-minutes"] ?? "20", "--lifetime-minutes", 1, 43200);
+  if ((options["lifetime-minutes"] || options["agent-deadline"]) && !["up", "resume"].includes(command)) throw new UsageError("Access duration is supported only for up or resume");
+  if (options["lifetime-minutes"] && options["agent-deadline"]) throw new UsageError("Choose --lifetime-minutes or --agent-deadline, not both");
+  if (options["agent-deadline"]) {
+    const now = Date.now();
+    agentDeadline = new Date(number(options["agent-deadline"], "--agent-deadline", now + 1, now + 2_592_000_000)).toISOString();
+    lifetime = Math.ceil((Date.parse(agentDeadline) - now) / 60_000);
+  }
   if (options["hold-seconds"]) number(options["hold-seconds"], "--hold-seconds", 1, 120);
   if (options.model && command !== "up") throw new UsageError("--model is set at creation; resume retains the saved model");
   if (options["dry-run"]) {
     if (command !== "up") throw new UsageError("--dry-run is supported only for up");
-    console.log(JSON.stringify({ command, model: options.model ?? "gpt-6-luna", count, lifetimeMinutes: lifetime, resources: ["private environment config", "scoped vault value", "dedicated Worker/SQLite namespace", `${count} independent VM/setup tasks`], mutates: false }, null, 2));
+    console.log(JSON.stringify({ command, model: options.model ?? "gpt-6-luna", count, lifetimeMinutes: lifetime, agentDeadline, resources: ["private environment config", "scoped vault value", "dedicated Worker/SQLite namespace", `${count} independent VM/setup tasks`], mutates: false }, null, 2));
     return;
   }
   if (!options["state-dir"]) throw new UsageError("--state-dir PATH is required");
@@ -553,10 +585,16 @@ async function main() {
   }
   secrets.push(state.relayToken);
   if (["resume", "ssh", "verify"].includes(command) && (state.closed || state.phase.startsWith("delet") || state.configDeleted || state.vaultDeleted || state.workerDeleted)) throw new Error("Session teardown has started; only status or down may use it");
+  if (["up", "resume"].includes(command)) agentDeadline ??= new Date(Date.now() + Number(options["lifetime-minutes"] ?? state.lifetimeMinutes) * 60_000).toISOString();
+  if (["ssh", "verify"].includes(command)) {
+    const selected = command === "ssh" ? state.vms.filter((vm) => vm.index === number(options.vm ?? "1", "--vm", 1, state.count)) : state.vms;
+    const expired = selected.find((vm) => vm.agentDeadline && Date.now() >= Date.parse(vm.agentDeadline));
+    if (expired) throw new Error(`VM ${expired.index} SSH access expired at ${expired.agentDeadline}; VM deletion is not established. Reconnect explicitly with resume --state-dir ${quote(directory)} --lifetime-minutes ${state.lifetimeMinutes}`);
+  }
   if (command === "verify") for (const vm of state.vms) vm.measurementPending = true;
   if (command === "ssh") {
     const index = number(options.vm ?? "1", "--vm", 1, state.count);
-    await run("ssh", [...sshArgs(state.vms.find((v) => v.index === index)), ...forwarded], { stdio: "inherit" });
+    await run("ssh", [...sshArgs(state.vms.find((v) => v.index === index)), ...(forwarded.length ? [forwarded.map(quote).join(" ")] : [])], { stdio: "inherit" });
     return;
   }
   const lock = path.join(directory, ".lock");
@@ -584,7 +622,10 @@ async function main() {
     else {
       if (!state.closed) await reconcile();
       result = summary();
-      if (!state.closed) result.runtimeStates = await Promise.all(state.vms.filter((v) => v.runtimeId).map(async (v) => ({ vm: v.index, ...(await request(RUNTIMES, cloudHeaders, "GET", `/api/cloud/environment/${segment(v.runtimeId)}/status`)) })));
+      if (!state.closed) result.runtimeStates = await Promise.all(state.vms.filter((v) => v.runtimeId).map(async (v) => {
+        const live = await request(RUNTIMES, cloudHeaders, "GET", `/api/cloud/environment/${segment(v.runtimeId)}/status`);
+        return { vm: v.index, status: live.status };
+      }));
     }
     console.log(options.json ? JSON.stringify(result, null, 2) : `${result.phase}: ${result.count} VM(s). State: ${directory}\n${command === "up" || command === "resume" ? "Run verify, ssh, or down --yes with this state directory." : JSON.stringify(result)}`);
   } finally { connection?.close(); fs.rmSync(lock, { recursive: true, force: true }); }
