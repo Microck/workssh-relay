@@ -30,17 +30,39 @@ Setup defaults to `gpt-6-luna` with medium reasoning at Standard speed. It was t
 - `up --dry-run`: print the intended resource changes without reading credentials, creating files, calling APIs or consuming credits.
 - `status --state-dir PATH`: show saved setup progress and live provider runtime states. `ready` is `null` for an unprobed session, or `false` after known teardown/offline state or the recorded agent deadline. `sshReachability` is `expired` after that deadline, otherwise `not-probed`. `setupComplete`, `lastSshVerifiedAt`, and the agent deadline are historical evidence, not current reachability. Provider `connected` does not mean the SSH agent is connected. No SSH probe or model task starts.
 - `resume --state-dir PATH [--lifetime-minutes N]`: recover the same runtime and request a restart only after exact argv checks show its supervisor is absent. The existing host-key pin must match before launch. The new process is detached from the model command session, but has its own timeout. The default recovery bound is the saved lifetime; an explicit bound applies only to this recovery. It never allocates replacements or regenerates keys. Credit consent applies to resumed model work too.
+- `keepalive --state-dir PATH --json`: issue one native `thread/resume` per saved VM with `excludeTurns: true`. This is separate from model-assisted `resume`. It requires a complete, unexpired, ready session, a connected runtime, a completed latest turn, and the original canonical local host pin. It checks the returned thread/runtime and config association when present, then re-reads the latest turn, runtime status, saved session and local pins. Changed identities or turn ID/status, teardown, expiry, offline runtimes, denials, timeouts and RPC/API failures stop the request without retries. It never starts model work, checks credit consent, installs or repairs an agent, reconciles resources, allocates replacements, renews a deadline or regenerates a pin.
 - `ssh --state-dir PATH --vm N -- [command...]`: connect with the saved private identity and pinned host key. Arguments after `--` are literal argv, including empty strings, quotes and multiline code. Use `-- sh -c 'shell expression'` explicitly for shell syntax. With no command, open an interactive shell. It does not edit normal SSH configuration.
 - `verify --state-dir PATH`: execute overlapping SSH commands on every saved VM, check distinct runtime IDs, hostnames and host keys, collect CPU/memory/filesystem measurements, and require every command to exit successfully. `--hold-seconds` defaults to 20.
 - `down --state-dir PATH --yes`: interrupt active owned setup turns, archive owned threads, delete the session's vault value, config and relay, confirm its runtimes are offline, and remove local private keys/configs. It does not delete other environments or overwrite an existing Worker. If any deletion cannot be confirmed, retain state and return a failure so you can retry cleanup.
 
 Cleanup attempts to remove the remote agent config and host keys before archiving. If SSH is already unavailable, it revokes relay access and checks that the runtime is offline instead. This does not guarantee erasure of platform-retained snapshots.
 
-Once teardown starts, `ssh`, `verify`, and `resume` refuse that session. Use `status` or repeat `down` to finish cleanup.
+Once teardown starts, `ssh`, `verify`, `resume`, and `keepalive` refuse that session. Use `status` or repeat `down` to finish cleanup.
 
 Use `--json` for machine-readable results, for example `npm run --silent cloud -- status --state-dir PATH --json`. Progress goes to stderr. `--help` works without credentials. Exit codes are 0 for success, 1 for runtime/API failures, and 2 for invalid arguments.
 
 `--auth-file` selects another Codex auth file. `--cloudflare-env` selects a private credentials file; process environment values take precedence over its values. `--account-id` overrides the account selected by the environment. Secrets are not accepted as command-line values.
+
+`keepalive --json` returns exactly this structure:
+
+```json
+{
+  "phase": "ready",
+  "count": 1,
+  "resumed": true,
+  "vms": [{
+    "index": 1,
+    "threadId": "saved-thread-id",
+    "runtimeId": "saved-runtime-id",
+    "status": "connected",
+    "latestTurnId": "unchanged-latest-turn-id",
+    "latestTurnStatus": "completed",
+    "latestTurnUnchanged": true
+  }]
+}
+```
+
+This reports native resume evidence, not an SSH probe. It makes no `ready: true` or deadline-extension claim. Run `ssh` or `verify` separately to check SSH access. A multi-VM request can stop after earlier VMs have resumed. The helper does not roll back or retry an issued resume. The plugin owns the durable one-shot issued marker and must retain it after failure or an uncertain outcome. The helper does not add a separate attempt journal or automatic retry path.
 
 ## Keep the session state private
 

@@ -19,10 +19,12 @@ const help = `WorkSSH Codex Cloud
 
   npm run cloud -- up --state-dir PATH --count 1
   npm run cloud -- verify --state-dir PATH
+  npm run cloud -- keepalive --state-dir PATH --json
   npm run cloud -- ssh --state-dir PATH --vm 1 -- uname -a
   npm run cloud -- down --state-dir PATH --yes
 
-Commands: up, resume, status, ssh, verify, down
+Commands: up, resume, keepalive, status, ssh, verify, down
+keepalive uses native resume only; no model work, SSH probe, or deadline renewal.
 Options:
   --state-dir PATH          Private session directory; required except for dry-run
   --count N                 Independent VMs, 1..8 (default 1)
@@ -359,6 +361,92 @@ async function resume() {
   return summary(true);
 }
 
+// This native-only operation never starts a turn or changes saved state.
+// The caller owns the durable one-shot issued marker; failures never retry here.
+export async function keepaliveSession(session, control) {
+  const original = JSON.stringify(session);
+  const fail = (reason) => { throw new Error(`Keepalive refused: ${reason}; no retry or model recovery was attempted`); };
+  const id = (value) => typeof value === "string" && value.trim().length > 0;
+  function validate(saved) {
+    if (saved.version !== 1 || saved.phase !== "ready" || saved.closed || saved.configDeleted || saved.vaultDeleted || saved.workerDeleted ||
+        saved.configPending || saved.vaultPending || saved.archivedThreadIds?.length ||
+        !id(saved.id) || !id(saved.cloudAccount) || !id(saved.configId) ||
+        !Number.isInteger(saved.count) || saved.count < 1 || saved.count > 8 || !Array.isArray(saved.vms) || saved.vms.length !== saved.count) fail("session is incomplete or teardown has started");
+    const threads = new Set(), runtimes = new Set(), indices = new Set();
+    for (const vm of saved.vms) {
+      if (!Number.isInteger(vm.index) || vm.index < 1 || vm.index > saved.count || indices.has(vm.index) ||
+          !id(vm.threadId) || threads.has(vm.threadId) || !id(vm.runtimeId) || runtimes.has(vm.runtimeId) ||
+          !id(vm.hostPublicKey) || !id(vm.turnId) || !id(vm.readyAt) || vm.offline ||
+          vm.allocationPending || vm.allocationRecovered || vm.setupPending || vm.pendingAgentDeadline || vm.remoteSecretsRemoved ||
+          !Number.isFinite(Date.parse(vm.agentDeadline)) || Date.now() >= Date.parse(vm.agentDeadline)) fail("VM identity, setup, or access deadline is not live and complete");
+      indices.add(vm.index); threads.add(vm.threadId); runtimes.add(vm.runtimeId);
+    }
+    if (saved.discoveredThreadIds?.some((threadId) => !threads.has(threadId)) ||
+        saved.discoveredRuntimes?.some((runtimeId) => !runtimes.has(runtimeId))) fail("saved discovery contains an unassigned identity");
+  }
+  async function checked(label, action) {
+    try { return await action(); }
+    catch { fail(`${label} failed`); } // Never expose provider payloads or credentials.
+  }
+  validate(session);
+  const pins = session.vms.map((vm) => canonicalHostKey(vm.hostPublicKey));
+  async function localUnchanged() {
+    const current = await checked("saved identity read", () => control.readSession());
+    validate(current);
+    if (JSON.stringify(current) !== original) fail("saved session changed");
+    for (const [i, vm] of session.vms.entries()) {
+      const pin = await checked("host pin read", () => control.readHostPin(vm));
+      if (pin.trim() !== `workssh.invalid ${pins[i]}`) fail("original local host pin changed");
+    }
+  }
+  async function latest(vm) {
+    const turns = await checked("latest turn read", () => control.readLatestTurns(vm));
+    if (!Array.isArray(turns) || turns.length !== 1 || !id(turns[0]?.id) || turns[0].status !== "completed") fail("latest turn is missing, active, or not completed");
+    return { id: turns[0].id, status: turns[0].status };
+  }
+  async function connected(vm) {
+    const runtime = await checked("runtime status read", () => control.readRuntime(vm));
+    if (runtime?.status !== "connected") fail("runtime is not connected");
+  }
+  await localUnchanged();
+  // Preflight every target before issuing any resume.
+  const turns = [];
+  for (const vm of session.vms) {
+    await connected(vm);
+    turns.push(await latest(vm));
+  }
+  const vms = [];
+  for (const [i, vm] of session.vms.entries()) {
+    await localUnchanged();
+    await connected(vm);
+    const before = await latest(vm);
+    if (before.id !== turns[i].id) fail("latest turn changed before resume");
+    await localUnchanged();
+    const resumed = await checked("native thread resume", () => control.call("thread/resume", { threadId: vm.threadId, excludeTurns: true }));
+    const thread = resumed?.thread;
+    const environments = thread?.environments;
+    if (thread?.id !== vm.threadId || !Array.isArray(environments) || environments.length !== 1 ||
+        environments[0]?.environmentId !== vm.runtimeId ||
+        (environments[0].environmentConfigId !== undefined && environments[0].environmentConfigId !== session.configId)) fail("resumed thread/runtime/config identity changed");
+    const after = await latest(vm);
+    if (after.id !== before.id || after.status !== before.status) fail("latest turn changed after resume");
+    await connected(vm);
+    await localUnchanged();
+    vms.push({ index: vm.index, threadId: vm.threadId, runtimeId: vm.runtimeId, status: "connected", latestTurnId: after.id, latestTurnStatus: "completed", latestTurnUnchanged: true });
+  }
+  return { phase: "ready", count: session.count, resumed: true, vms };
+}
+
+async function keepalive() {
+  return keepaliveSession(state, {
+    readSession: () => readPrivateJson(path.join(directory, "session.json")),
+    readHostPin: (vm) => fs.readFileSync(path.join(directory, `host-${vm.index}`), "utf8"),
+    readLatestTurns: async (vm) => (await cloud("GET", `/v2/threads/${segment(vm.threadId)}/turns?limit=1&sortDirection=desc&itemsView=notLoaded`)).data,
+    readRuntime: (vm) => request(RUNTIMES, cloudHeaders, "GET", `/api/cloud/environment/${segment(vm.runtimeId)}/status`),
+    call: async (method, params) => (await rpc()).call(method, params),
+  });
+}
+
 function sshArgs(vm) {
   if (state.closed || !vm?.hostPublicKey) throw new Error("VM is not ready; inspect status or resume");
   const config = path.join(directory, `vm-${vm.index}.json`);
@@ -548,7 +636,7 @@ async function main() {
   } });
   options = parsed.values;
   const [command, ...extra] = parsed.positionals;
-  if (!["up", "status", "resume", "ssh", "verify", "down"].includes(command) || extra.length) throw new UsageError("Choose up, status, resume, ssh, verify or down; use --help");
+  if (!["up", "status", "resume", "keepalive", "ssh", "verify", "down"].includes(command) || extra.length) throw new UsageError("Choose up, status, resume, keepalive, ssh, verify or down; use --help");
   if (forwarded.length && command !== "ssh") throw new UsageError("Only ssh accepts a command after --");
   const count = number(options.count ?? "1", "--count", 1, 8);
   let lifetime = number(options["lifetime-minutes"] ?? "20", "--lifetime-minutes", 1, 43200);
@@ -561,6 +649,7 @@ async function main() {
   }
   if (options["hold-seconds"]) number(options["hold-seconds"], "--hold-seconds", 1, 120);
   if (options.model && command !== "up") throw new UsageError("--model is set at creation; resume retains the saved model");
+  if (command === "keepalive" && ["allow-credits", "count", "hold-seconds", "vm", "yes", "cloudflare-env", "account-id"].some((key) => options[key] !== undefined)) throw new UsageError("keepalive accepts only --state-dir, --auth-file and --json");
   if (options["dry-run"]) {
     if (command !== "up") throw new UsageError("--dry-run is supported only for up");
     console.log(JSON.stringify({ command, model: options.model ?? "gpt-6-luna", count, lifetimeMinutes: lifetime, agentDeadline, resources: ["private environment config", "scoped vault value", "dedicated Worker/SQLite namespace", `${count} independent VM/setup tasks`], mutates: false }, null, 2));
@@ -584,7 +673,7 @@ async function main() {
     if (state.version !== 1) throw new Error("Unsupported session state version");
   }
   secrets.push(state.relayToken);
-  if (["resume", "ssh", "verify"].includes(command) && (state.closed || state.phase.startsWith("delet") || state.configDeleted || state.vaultDeleted || state.workerDeleted)) throw new Error("Session teardown has started; only status or down may use it");
+  if (["resume", "keepalive", "ssh", "verify"].includes(command) && (state.closed || state.phase.startsWith("delet") || state.configDeleted || state.vaultDeleted || state.workerDeleted)) throw new Error("Session teardown has started; only status or down may use it");
   if (["up", "resume"].includes(command)) agentDeadline ??= new Date(Date.now() + Number(options["lifetime-minutes"] ?? state.lifetimeMinutes) * 60_000).toISOString();
   if (["ssh", "verify"].includes(command)) {
     const selected = command === "ssh" ? state.vms.filter((vm) => vm.index === number(options.vm ?? "1", "--vm", 1, state.count)) : state.vms;
@@ -609,8 +698,9 @@ async function main() {
     }
     cloudHeaders = cloudCredentials(options["auth-file"]);
     secrets.push(cloudHeaders.Authorization.slice(7));
+    if (command === "keepalive" && !state.cloudAccount) throw new Error("Keepalive refused: saved OAuth ownership is missing");
     if (state.cloudAccount && state.cloudAccount !== cloudHeaders["ChatGPT-Account-ID"]) throw new Error("OAuth account differs from this session's owner");
-    state.cloudAccount = cloudHeaders["ChatGPT-Account-ID"];
+    if (command !== "keepalive") state.cloudAccount = cloudHeaders["ChatGPT-Account-ID"];
     if (command === "up" || command === "down") {
       cf = cloudflareCredentials(options["cloudflare-env"]);
       secrets.push(...Object.values(cf.headers).map((value) => value.replace(/^Bearer /, "")));
@@ -618,6 +708,7 @@ async function main() {
     let result;
     if (command === "up") result = await up(count);
     else if (command === "resume") result = await resume();
+    else if (command === "keepalive") result = await keepalive();
     else if (command === "down") result = state.closed ? summary() : await down();
     else {
       if (!state.closed) await reconcile();
