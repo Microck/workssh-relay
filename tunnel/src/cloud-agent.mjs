@@ -86,6 +86,6 @@ export async function launchAgent({ scratch, deadline, expectedHostKey }) {
 }
 
 export function agentLaunchCommand(options) {
-  const source = `${canonicalHostKey.toString()}\n${launchAgent.toString()}\nconst report = await launchAgent(${JSON.stringify(options)});\nconsole.log('HOST_PUBLIC_KEY=' + report.hostPublicKey);\nconsole.log('WORKSSH_AGENT=' + JSON.stringify(report));`;
+  const source = `${canonicalHostKey.toString()}\n${launchAgent.toString()}\nconst options = ${JSON.stringify(options)};\noptions.scratch = process.env.WORKSSH_SETUP_SCRATCH;\nconst report = await launchAgent(options);\nconsole.log('HOST_PUBLIC_KEY=' + report.hostPublicKey);\nconsole.log('WORKSSH_AGENT=' + JSON.stringify(report));`;
   return `node --input-type=module <<'WORKSSH_AGENT_LAUNCH'\n${source}\nWORKSSH_AGENT_LAUNCH`;
 }

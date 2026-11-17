@@ -67,8 +67,8 @@ let cf;
 function save() { privateJson(path.join(directory, "session.json"), state); }
 function checkInterrupted() { if (interrupted) throw new Error("Interrupted. Saved state retained; use status or down before retrying"); }
 const cloud = (method, endpoint, body) => request(CLOUD, cloudHeaders, method, endpoint, body);
-async function cloudflare(method, endpoint, body, contentType) {
-  const response = await request(CLOUDFLARE, cf.headers, method, endpoint, body, contentType);
+async function cloudflare(method, endpoint, body, contentType, signal) {
+  const response = await request(CLOUDFLARE, cf.headers, method, endpoint, body, contentType, signal);
   if (response.success === false) throw new Error(`Cloudflare rejected ${method} ${endpoint}: ${JSON.stringify(response.errors)}`);
   return response;
 }
@@ -223,20 +223,22 @@ async function up(count) {
 }
 
 export function setupCommand(vm, restarting, session = state) {
-  const launch = agentLaunchCommand({ scratch: vm.scratch, deadline: vm.pendingAgentDeadline, ...(restarting ? { expectedHostKey: canonicalHostKey(vm.hostPublicKey) } : {}) });
+  const launch = agentLaunchCommand({ deadline: vm.pendingAgentDeadline, ...(restarting ? { expectedHostKey: canonicalHostKey(vm.hostPublicKey) } : {}) });
   const installation = restarting ? [] : [
     `if [ -n "\${${session.variableName}:-}" ]; then printf 'vault_var_present=true\\n'; else printf 'vault_var_present=false\\n'; exit 1; fi`,
     `export WORKSSH_RELAY_TOKEN="\${${session.variableName}}"`,
-    `export WORKSSH_WORKER_URL=${quote(session.workerUrl)} WORKSSH_TUNNEL_ID=${quote(vm.tunnelId)} WORKSSH_PUBLIC_KEY=${quote(session.publicKey)} WORKSSH_STATE_DIR=${quote(`${vm.scratch}/state`)}`,
-    `mkdir -p ${quote(vm.scratch)}`,
-    `export npm_config_cache=${quote(`${vm.scratch}/npm-cache`)} npm_config_userconfig=${quote(`${vm.scratch}/npm-user`)} npm_config_globalconfig=${quote(`${vm.scratch}/npm-global`)}`,
+    `export WORKSSH_WORKER_URL=${quote(session.workerUrl)} WORKSSH_TUNNEL_ID=${quote(vm.tunnelId)} WORKSSH_PUBLIC_KEY=${quote(session.publicKey)} WORKSSH_STATE_DIR="$WORKSSH_SETUP_SCRATCH/state"`,
+    `mkdir -p -- "$WORKSSH_SETUP_SCRATCH"`,
+    `export npm_config_cache="$WORKSSH_SETUP_SCRATCH/npm-cache" npm_config_userconfig="$WORKSSH_SETUP_SCRATCH/npm-user" npm_config_globalconfig="$WORKSSH_SETUP_SCRATCH/npm-global"`,
     `touch "$npm_config_userconfig" "$npm_config_globalconfig"`,
     `curl --fail --silent --show-error "$WORKSSH_WORKER_URL/health"`,
-    `git clone --quiet ${quote(repoUrl)} ${quote(`${vm.scratch}/repo`)}`,
-    `git -C ${quote(`${vm.scratch}/repo`)} checkout --quiet ${agentRevision}`,
-    `bash ${quote(`${vm.scratch}/repo/scripts/install-agent.sh`)}`,
+    `git clone --quiet ${quote(repoUrl)} "$WORKSSH_SETUP_SCRATCH/repo"`,
+    `git -C "$WORKSSH_SETUP_SCRATCH/repo" checkout --quiet ${agentRevision}`,
+    `bash "$WORKSSH_SETUP_SCRATCH/repo/scripts/install-agent.sh"`,
   ];
-  const script = ["set -euo pipefail", ...installation, launch, "hostname"].join("\n");
+  // Keep the UUID-bearing root literal in one place. The model previously
+  // mistyped a repeated npm path while leaving mkdir's path unchanged.
+  const script = ["set -euo pipefail", `export WORKSSH_SETUP_SCRATCH=${quote(vm.scratch)}`, ...installation, launch, "hostname"].join("\n");
   const seconds = Math.max(1, Math.floor((Date.parse(vm.pendingAgentDeadline) - Date.now()) / 1000));
   return `timeout --signal=TERM --kill-after=5s ${seconds}s bash <<'WORKSSH_SETUP'\n${script}\nWORKSSH_SETUP`;
 }
@@ -561,31 +563,12 @@ async function down() {
     await absentAfterDelete(() => cloud("DELETE", `/v1/environment-configs/${segment(state.configId)}`), () => cloud("GET", `/v1/environment-configs/${segment(state.configId)}`));
     state.configDeleted = true;
   });
-  if (state.workerOwned && !state.workerDeleted) await step("relay", async () => {
-    if (state.namespaceId === undefined) {
-      try { state.namespaceId = (await cloudflare("GET", `${workerPath()}/settings`)).result.bindings.find((b) => b.name === "TUNNELS")?.namespace_id ?? null; }
-      catch (error) { if (!(error instanceof ApiError && error.status === 404)) throw error; }
-      save();
-    }
-    await absentAfterDelete(() => cloudflare("DELETE", workerPath()), () => cloudflare("GET", `${workerPath()}/settings`));
-    if (state.namespaceId) {
-      const remaining = (await cloudflare("GET", `/accounts/${segment(state.cloudflareAccountId)}/workers/durable_objects/namespaces`)).result;
-      if (remaining.some((n) => n.id === state.namespaceId)) throw new Error("Probe namespace deletion not confirmed");
-    }
-    state.workerDeleted = true;
-  });
+  if (state.workerOwned && !state.workerDeleted) await step("relay", () => deleteRelay(state, { request: cloudflare, save }));
   const runtimes = new Set([...state.vms.map((v) => v.runtimeId).filter(Boolean), ...(state.discoveredRuntimes ?? [])]);
   for (const id of runtimes) await step(`runtime ${id} teardown`, async () => {
-    for (let attempt = 0; attempt < 20; attempt++) {
-      const result = await request(RUNTIMES, cloudHeaders, "GET", `/api/cloud/environment/${segment(id)}/status`);
-      if (result.status === "offline") {
-        const vm = state.vms.find((v) => v.runtimeId === id);
-        if (vm) vm.offline = true;
-        return;
-      }
-      if (attempt === 19) throw new Error(`Runtime is ${result.status}, not offline; retry down after teardown completes`);
-      await delay(1000);
-    }
+    await confirmRuntimeOffline((signal) => request(RUNTIMES, cloudHeaders, "GET", `/api/cloud/environment/${segment(id)}/status`, undefined, undefined, signal));
+    const vm = state.vms.find((v) => v.runtimeId === id);
+    if (vm) vm.offline = true;
   });
   if (errors.length) throw new Error(`Cleanup incomplete; state and local keys retained:\n${errors.join("\n")}\nRun down again after inspecting failures`);
   delete state.relayToken;
@@ -596,6 +579,56 @@ async function down() {
   state.phase = "deleted";
   save();
   return summary();
+}
+
+export async function confirmRuntimeOffline(readStatus, { timeoutMs = 120_000, pollMs = 2000 } = {}) {
+  const signal = AbortSignal.timeout(timeoutMs);
+  let status;
+  try {
+    for (;;) {
+      signal.throwIfAborted();
+      status = (await readStatus(signal)).status;
+      if (status === "offline") return;
+      await delay(pollMs, undefined, { signal });
+    }
+  } catch (error) {
+    if (signal.aborted) throw new Error(`Runtime shutdown not confirmed within ${timeoutMs}ms; last observed status: ${status ?? "unobserved"}; state and local keys retained`, { cause: error });
+    throw error;
+  }
+}
+
+export async function deleteRelay(session, control, { timeoutMs = 120_000, pollMs = 2000 } = {}) {
+  const endpoint = `/accounts/${segment(session.cloudflareAccountId)}/workers/scripts/${segment(session.workerName)}`;
+  if (session.namespaceId === undefined) {
+    try { session.namespaceId = (await control.request("GET", `${endpoint}/settings`)).result.bindings.find((b) => b.name === "TUNNELS")?.namespace_id ?? null; }
+    catch (error) { if (!(error instanceof ApiError && error.status === 404)) throw error; }
+    control.save();
+  }
+  await absentAfterDelete(() => control.request("DELETE", endpoint), () => control.request("GET", `${endpoint}/settings`));
+  if (session.namespaceId) {
+    // Worker absence and namespace disappearance are separate observations.
+    // Repeat only listing reads; the deadline also aborts an in-flight request.
+    const signal = AbortSignal.timeout(timeoutMs);
+    const pageSize = 1000;
+    try {
+      for (;;) {
+        let present = false;
+        for (let page = 1; ; page++) {
+          signal.throwIfAborted();
+          const response = await control.request("GET", `/accounts/${segment(session.cloudflareAccountId)}/workers/durable_objects/namespaces?per_page=${pageSize}&page=${page}`, undefined, undefined, signal);
+          if (!Array.isArray(response.result)) throw new Error("Invalid namespace listing; deletion is unconfirmed");
+          if (response.result.some((namespace) => namespace.id === session.namespaceId)) { present = true; break; }
+          if (response.result.length < pageSize) break;
+        }
+        if (!present) break;
+        await delay(pollMs, undefined, { signal });
+      }
+    } catch (error) {
+      if (signal.aborted) throw new Error(`Probe namespace deletion not confirmed within ${timeoutMs}ms; state and local keys retained`, { cause: error });
+      throw error;
+    }
+  }
+  session.workerDeleted = true;
 }
 
 async function absentAfterDelete(remove, read) {

@@ -20,13 +20,14 @@ export class ApiError extends Error {
 // Native HTTP is intentional: the cloud service has rejected Node fetch while
 // accepting native HTTPS with the same OAuth identity. Never follow redirects
 // with credentials, retry mutations, or substitute another origin after denial.
-export function request(base, headers, method, endpoint, body, contentType = "application/json") {
+export function request(base, headers, method, endpoint, body, contentType = "application/json", signal) {
   const url = new URL(`${base}${endpoint}`);
   const bytes = body === undefined ? undefined : Buffer.isBuffer(body) ? body : Buffer.from(JSON.stringify(body));
   return new Promise((resolve, reject) => {
     const transport = url.protocol === "https:" ? https : http;
     const req = transport.request(url, {
       method,
+      signal,
       headers: { ...headers, ...(bytes ? { "Content-Type": contentType, "Content-Length": bytes.length } : {}) },
     }, (res) => {
       const chunks = [];

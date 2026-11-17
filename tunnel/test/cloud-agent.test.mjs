@@ -6,6 +6,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
 import { setTimeout as delay } from "node:timers/promises";
 import test from "node:test";
+import http from "node:http";
 import { setupCommand } from "../src/codex-cloud.mjs";
 
 async function fixture(t) {
@@ -98,4 +99,67 @@ test("changed host keys and elapsed deadlines prevent launch before any process 
   assert.match(expired.result.stderr, /deadline.*elapsed/i);
   await assert.rejects(fs.access(path.join(scratch, "supervisor-pid")), { code: "ENOENT" });
   await assert.rejects(fs.access(path.join(state, "agent-process.json")), { code: "ENOENT" });
+});
+
+test("fresh setup derives every installation path from one scratch root despite a copied-path transcription error", async (t) => {
+  const { scratch, state, wrappers } = await fixture(t);
+  const repository = path.join(scratch, "installer-fixture");
+  await fs.rename(path.join(scratch, "repo"), repository);
+  await fs.mkdir(path.join(repository, "scripts"));
+  await fs.writeFile(path.join(repository, "scripts/install-agent.sh"), `
+set -eu
+test -f "$npm_config_userconfig"
+test -f "$npm_config_globalconfig"
+printf '%s\\n' "$npm_config_cache" "$npm_config_userconfig" "$npm_config_globalconfig" "$WORKSSH_STATE_DIR" > "$WORKSSH_STATE_DIR/installation-paths"
+`);
+  const bin = path.join(scratch, "bin");
+  await fs.mkdir(bin);
+  // Stateful installer-source fixture. No remote Git server or cloud service is
+  // contacted; the generated command still runs real Bash, curl and processes.
+  await fs.writeFile(path.join(bin, "git"), `#!/bin/bash
+set -eu
+if [ "$1" = clone ]; then
+  target="\${@: -1}"
+  test ! -e "$target"
+  mkdir "$target"
+  cp -R "$FIXTURE_REPOSITORY/." "$target/"
+elif [ "$1" = -C ] && [ "$3" = checkout ]; then
+  test -d "$2"
+else
+  exit 71
+fi
+`, { mode: 0o700 });
+  const server = http.createServer((req, res) => {
+    assert.equal(req.url, "/health");
+    res.end('{"service":"fixture"}');
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  const deadline = new Date(Date.now() + 10_000).toISOString();
+  const command = setupCommand({ scratch, tunnelId: "fixture-tunnel", pendingAgentDeadline: deadline }, false, {
+    variableName: "WORKSSH_FIXTURE_SECRET",
+    workerUrl: `http://127.0.0.1:${server.address().port}`,
+    publicKey: "ssh-ed25519 QUFBQQ==",
+  });
+  // Replay the observed model error at the command boundary: only duplicated
+  // literal paths in the npm assignment acquire a different scratch suffix.
+  const copied = command.replace(/^export npm_config_[^\n]+/gm, line => line.replaceAll(scratch, scratch + "-mistyped"));
+  const child = spawn("bash", ["-c", copied], {
+    env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, FIXTURE_REPOSITORY: repository, WORKSSH_FIXTURE_SECRET: "fixture-only" },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let stdout = "", stderr = "";
+  child.stdout.on("data", chunk => { stdout += chunk; });
+  child.stderr.on("data", chunk => { stderr += chunk; });
+  const [code] = await once(child, "close");
+  const launch = stdout.match(/^WORKSSH_AGENT=(.+)$/m);
+  if (launch) wrappers.push(JSON.parse(launch[1]).wrapperPid);
+  assert.equal(code, 0, stderr);
+  assert.deepEqual((await fs.readFile(path.join(state, "installation-paths"), "utf8")).trim().split("\n"), [
+    path.join(scratch, "npm-cache"), path.join(scratch, "npm-user"), path.join(scratch, "npm-global"), state,
+  ]);
+  assert.match(stdout, /HOST_PUBLIC_KEY=ssh-ed25519 QUFBQQ==\n/);
+  assert.equal(JSON.parse(launch[1]).deadline, deadline);
+  await assert.rejects(fs.access(scratch + "-mistyped"), { code: "ENOENT" });
 });
