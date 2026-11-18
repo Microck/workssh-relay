@@ -224,9 +224,18 @@ async function up(count) {
 
 export function setupCommand(vm, restarting, session = state) {
   const launch = agentLaunchCommand({ deadline: vm.pendingAgentDeadline, ...(restarting ? { expectedHostKey: canonicalHostKey(vm.hostPublicKey) } : {}) });
+  // The setup model copies this heredoc by hand, so the script must not repeat
+  // the long per-session secret name. A run mistyped one character of
+  // WORKSSH_<SESSION_ID> and `set -u` aborted before installation. Derive the
+  // name from the scratch root instead: /tmp/workssh-<session id>-<index>.
+  const secretVariable = `WORKSSH_$(printf %s "\${WORKSSH_SETUP_SCRATCH##*/}" | cut -d- -f2 | tr a-f A-F)`;
+  if (!restarting && session.variableName !== `WORKSSH_${path.basename(vm.scratch).split("-")[1]?.toUpperCase()}`) throw new Error("Scratch root does not carry the session secret identity");
   const installation = restarting ? [] : [
-    `if [ -n "\${${session.variableName}:-}" ]; then printf 'vault_var_present=true\\n'; else printf 'vault_var_present=false\\n'; exit 1; fi`,
-    `export WORKSSH_RELAY_TOKEN="\${${session.variableName}}"`,
+    `workssh_secret_var="${secretVariable}"`,
+    `workssh_secret=$(printenv "$workssh_secret_var" || true)`,
+    `if [ -z "$workssh_secret" ]; then echo vault_var_present=false; exit 1; fi`,
+    `echo vault_var_present=true`,
+    `export WORKSSH_RELAY_TOKEN="$workssh_secret"`,
     `export WORKSSH_WORKER_URL=${quote(session.workerUrl)} WORKSSH_TUNNEL_ID=${quote(vm.tunnelId)} WORKSSH_PUBLIC_KEY=${quote(session.publicKey)} WORKSSH_STATE_DIR="$WORKSSH_SETUP_SCRATCH/state"`,
     `mkdir -p -- "$WORKSSH_SETUP_SCRATCH"`,
     `export npm_config_cache="$WORKSSH_SETUP_SCRATCH/npm-cache" npm_config_userconfig="$WORKSSH_SETUP_SCRATCH/npm-user" npm_config_globalconfig="$WORKSSH_SETUP_SCRATCH/npm-global"`,
@@ -261,8 +270,33 @@ async function startSetup(vm, restarting) {
   progress(`VM ${vm.index}: ${restarting ? "checking existing agent" : "setup task started"}`);
 }
 
+// The event stream is the fast path. When it closes before turn/completed, read
+// the same thread history that resume already reconciles from. Observation is
+// read-only, so no mutation is reissued and no replacement runtime is allocated.
+async function observeSetup(vm) {
+  try {
+    return await (await rpc()).wait(vm.threadId, vm.turnId);
+  } catch (error) {
+    if (!/^Cloud connection closed/.test(error.message)) throw error;
+    for (let attempt = 0; attempt < 150; attempt++) {
+      const turns = (await cloud("GET", `/v2/threads/${segment(vm.threadId)}/turns?limit=1&sortDirection=desc&itemsView=full`)).data;
+      const turn = turns[0];
+      if (turn && turn.status !== "inProgress") {
+        const messages = turn.items.filter((item) => item.type === "agentMessage").map((item) => item.text).join("\n");
+        const output = [messages, ...turn.items.filter((item) => item.type === "commandExecution").map((item) => item.aggregatedOutput ?? "")].join("\n");
+        const hostKey = output.match(/HOST_PUBLIC_KEY=(ssh-ed25519\s+[A-Za-z0-9+/=]+)/);
+        const launch = output.match(/WORKSSH_AGENT=(\{[^\r\n]+\})/);
+        const report = launch ? JSON.parse(launch[1]) : undefined;
+        return { status: turn.status, message: messages, hostPublicKey: hostKey?.[1], agentProcess: report && { deadline: report.deadline, wrapperPid: report.wrapperPid } };
+      }
+      await delay(2_000);
+    }
+    throw new Error(`VM ${vm.index} setup observation lost its connection and its task did not finish; inspect its task before down`);
+  }
+}
+
 async function finishSetup(vm) {
-  const result = await (await rpc()).wait(vm.threadId, vm.turnId);
+  const result = await observeSetup(vm);
   if (result.status !== "completed" || !result.hostPublicKey) throw new Error(`VM ${vm.index} did not report a host key: ${result.message ?? result.status}`);
   if (vm.hostPublicKey && canonicalHostKey(vm.hostPublicKey) !== canonicalHostKey(result.hostPublicKey)) throw new Error(`VM ${vm.index} host key changed; refusing automatic acceptance. Use down and create a fresh session`);
   if (!result.agentProcess || !Number.isFinite(Date.parse(result.agentProcess.deadline)) || Date.parse(result.agentProcess.deadline) > Date.parse(vm.pendingAgentDeadline)) throw new Error(`VM ${vm.index} did not confirm a bounded agent launch; inspect its task before retrying`);

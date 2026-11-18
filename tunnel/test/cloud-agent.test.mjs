@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -10,7 +11,10 @@ import http from "node:http";
 import { setupCommand } from "../src/codex-cloud.mjs";
 
 async function fixture(t) {
-  const scratch = await fs.mkdtemp(path.join(os.tmpdir(), "workssh-agent-test-"));
+  // Production scratch roots are /tmp/workssh-<session id>-<index>; the setup
+  // script derives the secret variable name from that shape.
+  const scratch = path.join(os.tmpdir(), `workssh-${crypto.randomBytes(12).toString("hex")}-1`);
+  await fs.mkdir(scratch, { mode: 0o700 });
   const state = path.join(scratch, "state");
   const source = path.join(scratch, "repo/tunnel/src");
   await fs.mkdir(state, { mode: 0o700 });
@@ -137,8 +141,9 @@ fi
   await once(server, "listening");
   t.after(() => new Promise(resolve => server.close(resolve)));
   const deadline = new Date(Date.now() + 10_000).toISOString();
+  const secretVariable = `WORKSSH_${path.basename(scratch).split("-")[1].toUpperCase()}`;
   const command = setupCommand({ scratch, tunnelId: "fixture-tunnel", pendingAgentDeadline: deadline }, false, {
-    variableName: "WORKSSH_FIXTURE_SECRET",
+    variableName: secretVariable,
     workerUrl: `http://127.0.0.1:${server.address().port}`,
     publicKey: "ssh-ed25519 QUFBQQ==",
   });
@@ -146,7 +151,7 @@ fi
   // literal paths in the npm assignment acquire a different scratch suffix.
   const copied = command.replace(/^export npm_config_[^\n]+/gm, line => line.replaceAll(scratch, scratch + "-mistyped"));
   const child = spawn("bash", ["-c", copied], {
-    env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, FIXTURE_REPOSITORY: repository, WORKSSH_FIXTURE_SECRET: "fixture-only" },
+    env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, FIXTURE_REPOSITORY: repository, [secretVariable]: "fixture-only" },
     stdio: ["ignore", "pipe", "pipe"],
   });
   let stdout = "", stderr = "";
